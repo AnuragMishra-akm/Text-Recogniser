@@ -58,6 +58,8 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.example.textrecogniser.ui.theme.TextRecogniserTheme
+import com.google.mlkit.nl.languageid.LanguageIdentification
+import com.google.mlkit.nl.languageid.LanguageIdentificationOptions
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
@@ -106,61 +108,13 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TextRecognizerApp() {
     var appState by remember { mutableStateOf(AppState.CAMERA) }
     var capturedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var recognizedText by remember { mutableStateOf("") }
-    var selectedLanguage by remember { mutableStateOf("Latin") }
-    var expanded by remember { mutableStateOf(false) }
-
-    val languages = listOf("Latin", "Devanagari", "Chinese", "Japanese", "Korean")
-
-    val recognizer = remember(selectedLanguage) {
-        when (selectedLanguage) {
-            "Devanagari" -> TextRecognition.getClient(DevanagariTextRecognizerOptions.Builder().build())
-            "Chinese" -> TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
-            "Japanese" -> TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())
-            "Korean" -> TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
-            else -> TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-        }
-    }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        if (appState == AppState.CAMERA) {
-            Box(modifier = Modifier.padding(16.dp)) {
-                ExposedDropdownMenuBox(
-                    expanded = expanded,
-                    onExpandedChange = { expanded = !expanded }
-                ) {
-                    OutlinedTextField(
-                        value = selectedLanguage,
-                        onValueChange = {},
-                        readOnly = true,
-                        label = { Text("Model Language") },
-                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-                        modifier = Modifier.menuAnchor().fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp)
-                    )
-                    ExposedDropdownMenu(
-                        expanded = expanded,
-                        onDismissRequest = { expanded = false }
-                    ) {
-                        languages.forEach { language ->
-                            DropdownMenuItem(
-                                text = { Text(language) },
-                                onClick = {
-                                    selectedLanguage = language
-                                    expanded = false
-                                }
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
         Box(modifier = Modifier.weight(1f)) {
             when (appState) {
                 AppState.CAMERA -> {
@@ -174,7 +128,7 @@ fun TextRecognizerApp() {
                         CropView(
                             bitmap = bitmap,
                             onCropDone = { croppedBitmap ->
-                                processImage(croppedBitmap, recognizer) { text ->
+                                performFullRecognition(croppedBitmap) { text ->
                                     recognizedText = text
                                     appState = AppState.RESULT
                                 }
@@ -194,6 +148,108 @@ fun TextRecognizerApp() {
                 }
             }
         }
+    }
+}
+
+private fun performFullRecognition(
+    bitmap: Bitmap,
+    onResult: (String) -> Unit
+) {
+    val inputImage = InputImage.fromBitmap(bitmap, 0)
+    val modelTypes = listOf(
+        ModelType.LATIN,
+        ModelType.DEVANAGARI,
+        ModelType.CHINESE,
+        ModelType.JAPANESE,
+        ModelType.KOREAN
+    )
+
+    val results = mutableMapOf<ModelType, String>()
+    var completedCount = 0
+
+    modelTypes.forEach { type ->
+        val recognizer = getRecognizer(type)
+        recognizer.process(inputImage)
+            .addOnCompleteListener { task ->
+                results[type] = if (task.isSuccessful) task.result.text else ""
+                completedCount++
+
+                if (completedCount == modelTypes.size) {
+                    selectBestResult(results, onResult)
+                }
+            }
+    }
+}
+
+private fun selectBestResult(results: Map<ModelType, String>, onResult: (String) -> Unit) {
+    // Combine all text to help identify the language
+    val combinedText = results.values.filter { it.isNotBlank() }.joinToString(" ")
+    if (combinedText.isBlank()) {
+        onResult("No text detected.")
+        return
+    }
+
+    val languageIdentifier = LanguageIdentification.getClient(
+        LanguageIdentificationOptions.Builder()
+            .setConfidenceThreshold(0.1f)
+            .build()
+    )
+
+    languageIdentifier.identifyLanguage(combinedText)
+        .addOnSuccessListener { languageCode ->
+            val bestModelType = getModelTypeForLanguage(languageCode)
+            
+            if (bestModelType == ModelType.NONE) {
+                onResult("No text detected (unsupported language: $languageCode)")
+                return@addOnSuccessListener
+            }
+
+            // Return the text from the model that best matches the detected language
+            val finalResult = results[bestModelType] ?: ""
+            if (finalResult.isNotBlank()) {
+                onResult(finalResult)
+            } else {
+                // Fallback: Pick the result with the most content if the identified model is empty
+                val fallback = results.values.maxByOrNull { it.length } ?: ""
+                onResult(fallback.ifBlank { "No text detected." })
+            }
+        }
+        .addOnFailureListener {
+            val fallback = results.values.maxByOrNull { it.length } ?: ""
+            onResult(fallback.ifBlank { "Identification failed." })
+        }
+}
+
+enum class ModelType {
+    LATIN, DEVANAGARI, CHINESE, JAPANESE, KOREAN, NONE
+}
+
+private fun getModelTypeForLanguage(languageCode: String): ModelType {
+    return when (languageCode) {
+        "en", "es", "fr", "de", "it", "pt", "vi" -> ModelType.LATIN
+        "hi", "mr", "ne", "sa", "ks", "sd" -> ModelType.DEVANAGARI
+        "zh", "zh-Hani", "zh-Hans", "zh-Hant" -> ModelType.CHINESE
+        "ja" -> ModelType.JAPANESE
+        "ko" -> ModelType.KOREAN
+        "und" -> ModelType.LATIN // Default to Latin if undetermined
+        else -> {
+            if (isLatinBased(languageCode)) ModelType.LATIN else ModelType.NONE
+        }
+    }
+}
+
+private fun isLatinBased(code: String): Boolean {
+    val latinCodes = setOf("af", "sq", "az", "eu", "bs", "ca", "cs", "da", "nl", "et", "fi", "gl", "hu", "is", "id", "ga", "lv", "lt", "ms", "mt", "no", "pl", "ro", "sk", "sl", "sv", "tr", "uz", "cy")
+    return code in latinCodes
+}
+
+private fun getRecognizer(type: ModelType): com.google.mlkit.vision.text.TextRecognizer {
+    return when (type) {
+        ModelType.DEVANAGARI -> TextRecognition.getClient(DevanagariTextRecognizerOptions.Builder().build())
+        ModelType.CHINESE -> TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
+        ModelType.JAPANESE -> TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())
+        ModelType.KOREAN -> TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build())
+        else -> TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     }
 }
 
@@ -274,7 +330,7 @@ fun CropView(
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var activeHandle by remember { mutableStateOf(DragHandle.NONE) }
 
-    val handleRadius = 40f // Detection radius in pixels
+    val handleRadius = 40f
 
     Box(
         modifier = Modifier
@@ -341,13 +397,11 @@ fun CropView(
                 )
             }
         ) {
-            // Draw dim overlay
             drawRect(Color.Black.copy(alpha = 0.6f), size = Size(containerSize.width.toFloat(), rect.top))
             drawRect(Color.Black.copy(alpha = 0.6f), topLeft = Offset(0f, rect.bottom), size = Size(containerSize.width.toFloat(), containerSize.height - rect.bottom))
             drawRect(Color.Black.copy(alpha = 0.6f), topLeft = Offset(0f, rect.top), size = Size(rect.left, rect.height))
             drawRect(Color.Black.copy(alpha = 0.6f), topLeft = Offset(rect.right, rect.top), size = Size(containerSize.width - rect.right, rect.height))
 
-            // Draw crop rectangle
             drawRect(
                 color = Color.Cyan,
                 topLeft = Offset(rect.left, rect.top),
@@ -355,7 +409,6 @@ fun CropView(
                 style = Stroke(width = 2.dp.toPx())
             )
 
-            // Draw handles
             val handleSize = 10.dp.toPx()
             val handleColor = Color.Cyan
             drawCircle(handleColor, radius = handleSize / 2, center = Offset(rect.left, rect.top))
@@ -457,10 +510,4 @@ fun ResultView(text: String, onRetake: () -> Unit) {
             Text("Retake Photo", fontSize = 18.sp)
         }
     }
-}
-
-private fun processImage(bitmap: Bitmap, recognizer: com.google.mlkit.vision.text.TextRecognizer, onResult: (String) -> Unit) {
-    recognizer.process(InputImage.fromBitmap(bitmap, 0))
-        .addOnSuccessListener { onResult(it.text) }
-        .addOnFailureListener { onResult("Error: ${it.message}") }
 }
