@@ -68,6 +68,7 @@ import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.File
+import java.util.Locale
 import kotlin.math.min
 import kotlin.math.sqrt
 
@@ -113,6 +114,7 @@ fun TextRecognizerApp() {
     var appState by remember { mutableStateOf(AppState.CAMERA) }
     var capturedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var recognizedText by remember { mutableStateOf("") }
+    var detectedLanguage by remember { mutableStateOf("") }
 
     Column(modifier = Modifier.fillMaxSize()) {
         Box(modifier = Modifier.weight(1f)) {
@@ -128,8 +130,9 @@ fun TextRecognizerApp() {
                         CropView(
                             bitmap = bitmap,
                             onCropDone = { croppedBitmap ->
-                                performFullRecognition(croppedBitmap) { text ->
+                                performFullRecognition(croppedBitmap) { text, language ->
                                     recognizedText = text
+                                    detectedLanguage = language
                                     appState = AppState.RESULT
                                 }
                             },
@@ -140,8 +143,10 @@ fun TextRecognizerApp() {
                 AppState.RESULT -> {
                     ResultView(
                         text = recognizedText,
+                        language = detectedLanguage,
                         onRetake = {
                             recognizedText = ""
+                            detectedLanguage = ""
                             appState = AppState.CAMERA
                         }
                     )
@@ -153,7 +158,7 @@ fun TextRecognizerApp() {
 
 private fun performFullRecognition(
     bitmap: Bitmap,
-    onResult: (String) -> Unit
+    onResult: (String, String) -> Unit
 ) {
     val inputImage = InputImage.fromBitmap(bitmap, 0)
     val modelTypes = listOf(
@@ -168,8 +173,7 @@ private fun performFullRecognition(
     var completedCount = 0
 
     modelTypes.forEach { type ->
-        val recognizer = getRecognizer(type)
-        recognizer.process(inputImage)
+        getRecognizer(type).process(inputImage)
             .addOnCompleteListener { task ->
                 results[type] = if (task.isSuccessful) task.result.text else ""
                 completedCount++
@@ -181,42 +185,39 @@ private fun performFullRecognition(
     }
 }
 
-private fun selectBestResult(results: Map<ModelType, String>, onResult: (String) -> Unit) {
-    // Combine all text to help identify the language
-    val combinedText = results.values.filter { it.isNotBlank() }.joinToString(" ")
-    if (combinedText.isBlank()) {
-        onResult("No text detected.")
+private fun selectBestResult(results: Map<ModelType, String>, onResult: (String, String) -> Unit) {
+    val validResults = results.filter { it.value.isNotBlank() }
+    if (validResults.isEmpty()) {
+        onResult("No text detected.", "Unknown")
         return
     }
 
+    // We pass the result with the most content to the identifier
+    val representativeText = validResults.values.maxByOrNull { it.length } ?: ""
+
     val languageIdentifier = LanguageIdentification.getClient(
         LanguageIdentificationOptions.Builder()
-            .setConfidenceThreshold(0.1f)
+            .setConfidenceThreshold(0.2f)
             .build()
     )
 
-    languageIdentifier.identifyLanguage(combinedText)
+    languageIdentifier.identifyLanguage(representativeText)
         .addOnSuccessListener { languageCode ->
-            val bestModelType = getModelTypeForLanguage(languageCode)
+            val detectedModelType = getModelTypeForLanguage(languageCode)
+            val languageName = if (languageCode == "und") "Undetermined" else Locale(languageCode).displayLanguage
             
-            if (bestModelType == ModelType.NONE) {
-                onResult("No text detected (unsupported language: $languageCode)")
-                return@addOnSuccessListener
+            // If the identifier found a specific model we support, use its output.
+            // Otherwise, fallback to whichever model found the most characters.
+            val finalModelType = if (detectedModelType != ModelType.NONE && results[detectedModelType]?.isNotBlank() == true) {
+                detectedModelType
+            } else {
+                validResults.maxByOrNull { it.value.length }?.key ?: ModelType.LATIN
             }
 
-            // Return the text from the model that best matches the detected language
-            val finalResult = results[bestModelType] ?: ""
-            if (finalResult.isNotBlank()) {
-                onResult(finalResult)
-            } else {
-                // Fallback: Pick the result with the most content if the identified model is empty
-                val fallback = results.values.maxByOrNull { it.length } ?: ""
-                onResult(fallback.ifBlank { "No text detected." })
-            }
+            onResult(results[finalModelType] ?: representativeText, languageName)
         }
         .addOnFailureListener {
-            val fallback = results.values.maxByOrNull { it.length } ?: ""
-            onResult(fallback.ifBlank { "Identification failed." })
+            onResult(representativeText, "Error")
         }
 }
 
@@ -231,7 +232,6 @@ private fun getModelTypeForLanguage(languageCode: String): ModelType {
         "zh", "zh-Hani", "zh-Hans", "zh-Hant" -> ModelType.CHINESE
         "ja" -> ModelType.JAPANESE
         "ko" -> ModelType.KOREAN
-        "und" -> ModelType.LATIN // Default to Latin if undetermined
         else -> {
             if (isLatinBased(languageCode)) ModelType.LATIN else ModelType.NONE
         }
@@ -462,7 +462,7 @@ private fun performCrop(bitmap: Bitmap, rect: Rect, containerSize: IntSize): Bit
 }
 
 @Composable
-fun ResultView(text: String, onRetake: () -> Unit) {
+fun ResultView(text: String, language: String, onRetake: () -> Unit) {
     val context = LocalContext.current
     Column(
         modifier = Modifier
@@ -470,7 +470,19 @@ fun ResultView(text: String, onRetake: () -> Unit) {
             .padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text("Recognized Text", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(bottom = 16.dp))
+        Text("Recognized Text", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+        
+        if (language.isNotBlank()) {
+            Text(
+                text = "Detected Language: $language",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.secondary,
+                modifier = Modifier.padding(bottom = 16.dp)
+            )
+        } else {
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
         Card(
             modifier = Modifier
                 .weight(1f)
